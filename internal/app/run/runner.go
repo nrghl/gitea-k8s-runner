@@ -70,11 +70,11 @@ func NewRunner(cfg *config.Config, reg *config.Registration, cli client.Client) 
 
 // Run executes the given task.
 func (r *Runner) Run(ctx context.Context, task *runnerv1.Task) error {
-    if _, ok := r.runningTasks.Load(task.Id); ok {
-        log.WithFields(log.Fields{
-            "taskID": task.Id,
-        }).Error("Task is already running")
-        return fmt.Errorf("task %d is already running", task.Id)
+    // Early error logging with logrus is acceptable when reporter is not available.
+    if _, exists := r.runningTasks.Load(task.Id); exists {
+        errMsg := fmt.Sprintf("Task %d is already running", task.Id)
+        log.WithField("taskID", task.Id).Error(errMsg)
+        return fmt.Errorf(errMsg)
     }
     r.runningTasks.Store(task.Id, struct{}{})
     defer r.runningTasks.Delete(task.Id)
@@ -82,27 +82,23 @@ func (r *Runner) Run(ctx context.Context, task *runnerv1.Task) error {
     ctx, cancel := context.WithTimeout(ctx, r.cfg.Runner.Timeout)
     defer cancel()
     reporter := report.NewReporter(ctx, cancel, r.client, task)
+
+    // Use the reporter for a user-facing start message.
+    reporter.Logf("🚀 Starting task %d (runner: %s)", task.Id, r.name)
+
     var runErr error
     defer func() {
         lastWords := ""
         if runErr != nil {
             lastWords = runErr.Error()
-            log.WithFields(log.Fields{
-                "taskID": task.Id,
-            }).Errorf("Task failed: %v", runErr)
+            reporter.Logf("❌ Task %d failed: %v", task.Id, runErr)
         }
         _ = reporter.Close(lastWords)
     }()
 
-    log.WithFields(log.Fields{
-        "taskID": task.Id,
-        "runner": r.name,
-    }).Info("Starting task execution")
-
     reporter.RunDaemon()
     runErr = r.run(ctx, task, reporter)
-
-    return nil
+    return runErr
 }
 
 // run handles the core logic of executing a task.
@@ -110,36 +106,29 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
     defer func() {
         if rec := recover(); rec != nil {
             err = fmt.Errorf("panic: %v", rec)
-            log.WithFields(log.Fields{
-                "taskID": task.Id,
-                "runner": r.name,
-            }).Errorf("Recovered from panic: %v", rec)
+            // Report the panic through the reporter.
+            reporter.Logf("Recovered from panic: %v", rec)
         }
     }()
 
     reporter.Logf("%s(version:%s) received task %v of job %v, triggered by event: %s",
-        r.name, ver.Version(), task.Id, task.Context.Fields["job"].GetStringValue(), task.Context.Fields["event_name"].GetStringValue())
+        r.name, ver.Version(), task.Id,
+        task.Context.Fields["job"].GetStringValue(),
+        task.Context.Fields["event_name"].GetStringValue())
 
-    // Generate the workflow and retrieve the job ID
-    log.WithFields(log.Fields{
-        "taskID": task.Id,
-    }).Debug("Generating workflow for task")
+    // Generate the workflow and retrieve the job ID.
+    reporter.Logf("Generating workflow for task %v", task.Id)
     workflow, jobID, err := generateWorkflow(task)
     if err != nil {
-        reporter.Logf("❌ Failed to generate workflow for task %v", task.Id)
-        log.WithFields(log.Fields{
-            "taskID": task.Id,
-        }).Errorf("Workflow generation failed: %v", err)
+        reporter.Logf("❌ Failed to generate workflow for task %v: %v", task.Id, err)
         return fmt.Errorf("workflow generation failed: %v", err)
     }
 
     job := workflow.GetJob(jobID)
     reporter.ResetSteps(len(job.Steps))
 
-    // Prepare Kubernetes resources needed for the workflow steps
-    log.WithFields(log.Fields{
-        "taskID": task.Id,
-    }).Info("Preparing Kubernetes resources for the workflow")
+    // Prepare Kubernetes resources needed for the workflow steps.
+    reporter.Logf("Preparing Kubernetes resources for the workflow for task %v", task.Id)
     preset := r.preparePresetContext(task)
     giteaRuntimeToken := task.Context.Fields["gitea_runtime_token"].GetStringValue()
     if giteaRuntimeToken == "" {
@@ -149,46 +138,29 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
 
     eventJSON, err := json.Marshal(preset.Event)
     if err != nil {
-        reporter.Logf("❌ Failed to marshal event JSON for task %v", task.Id)
-        log.WithFields(log.Fields{
-            "taskID": task.Id,
-        }).Errorf("Event JSON marshaling failed: %v", err)
+        reporter.Logf("❌ Failed to marshal event JSON for task %v: %v", task.Id, err)
         return fmt.Errorf("event JSON marshaling failed: %v", err)
     }
 
     if err := r.prepareK8sResourcesForTask(ctx, task, workflow, eventJSON, reporter); err != nil {
-        reporter.Logf("❌ Failed to prepare Kubernetes resources for task %v", task.Id)
-        log.WithFields(log.Fields{
-            "taskID": task.Id,
-        }).Errorf("Kubernetes resource preparation failed: %v", err)
+        reporter.Logf("❌ Failed to prepare Kubernetes resources for task %v: %v", task.Id, err)
         return fmt.Errorf("Kubernetes resource preparation failed: %v", err)
     }
 
-    log.WithFields(log.Fields{
-        "taskID": task.Id,
-    }).Info("Executing workflow steps")
-
-    // Execute the workflow steps
+    reporter.Logf("Executing workflow steps for task %v", task.Id)
     err = r.runWorkflowSteps(ctx, task, workflow, jobID, reporter)
     if err != nil {
-        reporter.Logf("❌ Workflow steps failed for task %v", task.Id)
-        log.WithFields(log.Fields{
-            "taskID": task.Id,
-        }).Errorf("Workflow steps execution failed: %v", err)
+        reporter.Logf("❌ Workflow steps failed for task %v: %v", task.Id, err)
     }
 
-    // Cleanup Kubernetes resources after step execution
-    log.WithFields(log.Fields{
-        "taskID": task.Id,
-    }).Info("Cleaning up Kubernetes resources for the workflow")
+    // Cleanup Kubernetes resources after step execution.
+    reporter.Logf("Cleaning up Kubernetes resources for the workflow for task %v", task.Id)
     if cleanupErr := r.cleanupK8sTaskResources(ctx, task, reporter); cleanupErr != nil {
-        reporter.Logf("❌ Failed to cleanup Kubernetes resources for task %v", task.Id)
-        log.WithFields(log.Fields{
-            "taskID": task.Id,
-        }).Errorf("Cleanup failed: %v", cleanupErr)
+        reporter.Logf("❌ Failed to cleanup Kubernetes resources for task %v: %v", task.Id, cleanupErr)
         return fmt.Errorf("cleanup failed: %v", cleanupErr)
     }
 
+    // Signal workflow completion.
     reporter.Fire(&log.Entry{
         Time: time.Now(),
         Data: log.Fields{
@@ -197,10 +169,7 @@ func (r *Runner) run(ctx context.Context, task *runnerv1.Task, reporter *report.
         Message: "🏁 Workflow Completed",
     })
 
-    log.WithFields(log.Fields{
-        "taskID": task.Id,
-    }).Info("Task execution completed successfully")
-
+    reporter.Logf("Task execution completed successfully for task %v", task.Id)
     return nil
 }
 
@@ -209,45 +178,33 @@ func (r *Runner) runWorkflowSteps(ctx context.Context, task *runnerv1.Task, work
     job := workflow.Jobs[jobID]
     steps := job.Steps
 
-    // Default image if none is specified
+    // Default image if none is specified.
     image := "catthehacker/ubuntu:act-latest"
-
-    container := job.Container()
-    if container != nil && container.Image != "" {
+    if container := job.Container(); container != nil && container.Image != "" {
         image = container.Image
     }
 
     for stepIndex, step := range steps {
-        log.WithFields(log.Fields{
-            "taskID": task.Id,
-            "stepIndex": stepIndex,
-            "stepName": step.Name,
-        }).Info("🚀 Starting Step")
-
         reporter.Fire(&log.Entry{
             Time: time.Now(),
             Data: log.Fields{
+                "taskID":     task.Id,
                 "stepNumber": stepIndex,
                 "stage":      "Main",
             },
-            Message: fmt.Sprintf("Starting Step: %s", step.Name),
+            Message: fmt.Sprintf("🚀 Starting Step: %s", step.Name),
         })
 
         if err := r.runStepInKubernetes(ctx, task, step, stepIndex, image, reporter); err != nil {
-            log.WithFields(log.Fields{
-                "taskID": task.Id,
-                "stepIndex": stepIndex,
-                "stepName": step.Name,
-            }).Errorf("❌ Step failed: %v", err)
-
             reporter.Fire(&log.Entry{
                 Time: time.Now(),
                 Data: log.Fields{
+                    "taskID":     task.Id,
                     "stepNumber": stepIndex,
                     "stage":      "Main",
                     "stepResult": "failure",
                 },
-                Message: fmt.Sprintf("Step %s failed", step.Name),
+                Message: fmt.Sprintf("❌ Step %s failed: %v", step.Name, err),
             })
 
             if ctx.Err() == context.Canceled {
@@ -257,15 +214,10 @@ func (r *Runner) runWorkflowSteps(ctx context.Context, task *runnerv1.Task, work
             return err
         }
 
-        log.WithFields(log.Fields{
-            "taskID": task.Id,
-            "stepIndex": stepIndex,
-            "stepName": step.Name,
-        }).Info("✅ Step completed successfully")
-
         reporter.Fire(&log.Entry{
             Time: time.Now(),
             Data: log.Fields{
+                "taskID":     task.Id,
                 "stepNumber": stepIndex,
                 "stage":      "Main",
                 "stepResult": "success",
